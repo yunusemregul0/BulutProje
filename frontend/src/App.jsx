@@ -49,8 +49,14 @@ api.interceptors.request.use(
   async (config) => {
     try {
       if (auth.currentUser) {
-        const token = await auth.currentUser.getIdToken();
+        const token = await auth.currentUser.getIdToken(true);
         config.headers.Authorization = `Bearer ${token}`;
+      } else {
+        // Try to get token from localStorage if no current user
+        const storedToken = localStorage.getItem("authToken");
+        if (storedToken) {
+          config.headers.Authorization = `Bearer ${storedToken}`;
+        }
       }
       return config;
     } catch (error) {
@@ -227,11 +233,17 @@ function App() {
         setLoading(true);
 
         if (user) {
+          // Get the ID token and store it
+          const token = await user.getIdToken();
+          localStorage.setItem("authToken", token);
+
           await Promise.all([
             fetchFolders().catch(console.error),
             fetchSnippets().catch(console.error),
           ]);
         } else {
+          // Clear stored token on logout
+          localStorage.removeItem("authToken");
           setSnippets([]);
           setFolders([]);
         }
@@ -247,7 +259,15 @@ function App() {
       }
     };
 
+    // Set up auth state listener
     const unsubscribe = onAuthStateChanged(auth, handleAuthChange);
+
+    // Check for stored token on mount
+    const storedToken = localStorage.getItem("authToken");
+    if (storedToken && !user) {
+      // If we have a stored token but no user, try to restore the session
+      auth.currentUser?.getIdToken(true).catch(console.error);
+    }
 
     return () => {
       isMounted = false;
@@ -321,17 +341,83 @@ function App() {
 
       console.log("Received snippets:", response.data);
 
-      const filteredSnippets = response.data.filter((snippet) => {
-        if (currentFolder === "/") {
-          return !snippet.folderPath || snippet.folderPath === "/";
-        }
-        return snippet.folderPath === currentFolder;
-      });
+      // Eğer gelen veri bir dizi ve ilk elemanı string ise, bu klasör yollarıdır
+      if (
+        Array.isArray(response.data) &&
+        typeof response.data[0] === "string"
+      ) {
+        // Sadece mevcut klasörün alt klasörlerini filtrele
+        const filteredFolders = response.data.filter((folderPath) => {
+          if (currentFolder === "/") {
+            return folderPath.split("/").length === 2;
+          }
+          return (
+            folderPath.startsWith(currentFolder) &&
+            folderPath.split("/").length === currentFolder.split("/").length + 1
+          );
+        });
 
-      setSnippets(filteredSnippets);
+        // Klasörleri işle
+        const processedFolders = filteredFolders.map((folderPath) => ({
+          _id: `folder-${folderPath}`,
+          title: folderPath === "/" ? "Root" : folderPath.split("/").pop(),
+          code: "",
+          language: "text",
+          description: "Folder",
+          tags: ["folder"],
+          isPublic: false,
+          folderPath: folderPath,
+          isFolderMarker: true,
+          userId: user.uid,
+          userEmail: user.email,
+          userName: user.displayName || "Unknown",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }));
+
+        setSnippets(processedFolders);
+        return;
+      }
+
+      // Normal snippet işleme
+      const processedSnippets = response.data
+        .map((snippet) => {
+          if (snippet.isFolderMarker) return null;
+          if (snippet.folderPath !== currentFolder) return null;
+
+          const isShared =
+            Array.isArray(snippet.sharedWith) &&
+            snippet.sharedWith.includes(user.email);
+
+          return {
+            _id: snippet._id,
+            title: snippet.title || "Untitled",
+            code: snippet.code || "",
+            language: snippet.language || "text",
+            description: snippet.description || "",
+            tags: Array.isArray(snippet.tags) ? snippet.tags : [],
+            isPublic: !!snippet.isPublic,
+            sharedWith: Array.isArray(snippet.sharedWith)
+              ? snippet.sharedWith
+              : [],
+            canEdit: Array.isArray(snippet.canEdit) ? snippet.canEdit : [],
+            folderPath: snippet.folderPath || "/",
+            userId: snippet.userId || "",
+            userEmail: snippet.userEmail || "",
+            userName: snippet.userName || "Unknown",
+            createdAt: snippet.createdAt || new Date().toISOString(),
+            updatedAt: snippet.updatedAt || new Date().toISOString(),
+            isShared: isShared,
+            isOwner: snippet.userId === user.uid,
+          };
+        })
+        .filter(Boolean);
+
+      console.log("Processed snippets:", processedSnippets);
+      setSnippets(processedSnippets);
     } catch (error) {
       console.error("Error fetching snippets:", error);
-      setSnippets([]); // Set empty snippets on error
+      setSnippets([]);
       if (!error.message.includes("Network error")) {
         toast.error("Failed to fetch snippets. Please try again.");
       }
@@ -527,11 +613,26 @@ function App() {
     e.preventDefault();
     try {
       setError(null);
+
+      // Validate required fields
+      if (!title.trim()) {
+        toast.error("Title is required");
+        return;
+      }
+      if (!code.trim()) {
+        toast.error("Code is required");
+        return;
+      }
+      if (!user) {
+        toast.error("You must be logged in to save snippets");
+        return;
+      }
+
       const snippetData = {
-        title,
-        code,
-        language,
-        description,
+        title: title.trim(),
+        code: code.trim(),
+        language: language || "text",
+        description: description.trim(),
         folderPath: currentFolder,
         tags: tags
           .split(",")
@@ -544,10 +645,10 @@ function App() {
       };
 
       if (isEditing) {
-        await api.put(`/api/snippets/${editingId}`, snippetData);
+        await api.put(`${API_ENDPOINTS.snippets}/${editingId}`, snippetData);
         toast.success("Snippet updated successfully!");
       } else {
-        await api.post("/api/snippets", snippetData);
+        await api.post(API_ENDPOINTS.snippets, snippetData);
         toast.success("Snippet created successfully!");
       }
 
@@ -559,10 +660,10 @@ function App() {
       setIsPublic(false);
       setIsEditing(false);
       setEditingId(null);
-      fetchSnippets();
+      await fetchSnippets();
     } catch (error) {
       console.error("Error saving snippet:", error);
-      toast.error(error.message || "Failed to save snippet");
+      toast.error(error.response?.data?.message || "Failed to save snippet");
     }
   };
 
@@ -572,15 +673,25 @@ function App() {
         return toast.error("Please enter an email address");
       }
 
-      await api.post(`/snippets/${snippetId}/share`, {
-        sharedWith: [shareEmail],
-        canEdit: [shareEmail], // Give edit permission to shared user
-      });
+      const response = await api.post(
+        `${API_ENDPOINTS.snippets}/${snippetId}/share`,
+        {
+          sharedWith: [shareEmail],
+          canEdit: [shareEmail], // Give edit permission to shared user
+        }
+      );
 
-      toast.success("Snippet shared successfully!");
-      setShareEmail("");
+      if (response.status === 200 || response.status === 201) {
+        toast.success("Snippet shared successfully!");
+        setShareEmail("");
+        // Snippet listesini güncelle
+        await fetchSnippets();
+      } else {
+        throw new Error("Failed to share snippet");
+      }
     } catch (error) {
-      toast.error(error.message || "Failed to share snippet");
+      console.error("Error sharing snippet:", error);
+      toast.error(error.response?.data?.message || "Failed to share snippet");
     }
   };
 
@@ -854,11 +965,13 @@ function App() {
                 value={shareEmail}
                 onChange={(e) => setShareEmail(e.target.value)}
                 placeholder="Enter email to share"
+                className="share-input"
               />
               <button
                 onClick={() => handleShare(snippet._id)}
                 className="btn btn-icon"
                 title="Share"
+                disabled={!shareEmail.trim()}
               >
                 <FiShare2 />
               </button>
@@ -886,6 +999,147 @@ function App() {
     borderRadius: "4px",
     width: "100%",
     marginBottom: "8px",
+  };
+
+  const renderSnippetCard = (snippet) => {
+    if (!snippet || !snippet._id) return null;
+
+    // Eğer bu bir klasör ise, farklı bir görünüm göster
+    if (snippet.isFolderMarker) {
+      return (
+        <div key={snippet._id} className="snippet-card folder-card">
+          <div className="snippet-header">
+            <h3>
+              <FiFolder /> {snippet.title}
+            </h3>
+            <div className="snippet-badges">
+              <span className="folder-badge">Folder</span>
+            </div>
+          </div>
+          <div className="snippet-meta">
+            <span>Path: {snippet.folderPath}</span>
+          </div>
+          <div className="snippet-actions">
+            <button
+              onClick={() => setCurrentFolder(snippet.folderPath)}
+              className="btn btn-primary"
+            >
+              Open Folder
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // Normal snippet görünümü
+    return (
+      <div
+        key={snippet._id}
+        className={`snippet-card ${snippet.isShared ? "shared-snippet" : ""}`}
+      >
+        <div className="snippet-header">
+          <h3>{snippet.title || "Untitled"}</h3>
+          <div className="snippet-badges">
+            <span className="language-badge">{snippet.language || "text"}</span>
+            {snippet.isPublic && <span className="public-badge">Public</span>}
+            {snippet.isShared && <span className="shared-badge">Shared</span>}
+            {!snippet.isOwner && (
+              <span className="shared-with-me-badge">Shared with me</span>
+            )}
+          </div>
+        </div>
+
+        <div className="snippet-meta">
+          <span>By: {snippet.userName || "Unknown"}</span>
+          <span>{new Date(snippet.createdAt).toLocaleDateString()}</span>
+        </div>
+
+        {snippet.description && (
+          <p className="snippet-description">{snippet.description}</p>
+        )}
+
+        <div className="code-container">
+          <SyntaxHighlighter
+            language={snippet.language || "text"}
+            style={themes[codeTheme]}
+            customStyle={{
+              padding: "1rem",
+              borderRadius: "0.5rem",
+              fontSize: "0.9rem",
+            }}
+          >
+            {snippet.code || ""}
+          </SyntaxHighlighter>
+        </div>
+
+        {snippet.tags &&
+          Array.isArray(snippet.tags) &&
+          snippet.tags.length > 0 && (
+            <div className="snippet-tags">
+              {snippet.tags.map((tag, index) => (
+                <span key={index} className="tag">
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
+
+        {renderSnippetActions(snippet)}
+      </div>
+    );
+  };
+
+  // Update the snippets list section to use the new renderSnippetCard function
+  const renderSnippetsList = () => {
+    if (view === "my-snippets") {
+      // Group snippets by folder and sort folders
+      const groupedSnippets = snippets.reduce((acc, snippet) => {
+        const folder = snippet.folderPath || "/";
+        if (!acc[folder]) acc[folder] = [];
+        acc[folder].push(snippet);
+        return acc;
+      }, {});
+
+      return Object.entries(groupedSnippets)
+        .sort(([folderA], [folderB]) => folderA.localeCompare(folderB))
+        .map(([folder, folderSnippets]) => {
+          if (folderSnippets.length === 0) return null;
+
+          const folderDisplay =
+            folder === "/" ? "Root" : folder.split("/").pop();
+          const fullPath = folder === "/" ? "Root" : folder;
+
+          return (
+            <div key={folder} className="folder-group">
+              <div className="folder-group-header">
+                <div className="folder-group-title">
+                  <FiFolder />
+                  <h3>{folderDisplay}</h3>
+                  <span className="folder-path">{fullPath}</span>
+                </div>
+                <div className="folder-group-actions">
+                  <span className="snippet-count">
+                    {folderSnippets.length} snippet
+                    {folderSnippets.length !== 1 ? "s" : ""}
+                  </span>
+                  <button
+                    onClick={() => setCurrentFolder(folder)}
+                    className="btn btn-outline btn-sm"
+                  >
+                    Open Folder
+                  </button>
+                </div>
+              </div>
+              <div className="snippets-grid">
+                {folderSnippets.map(renderSnippetCard)}
+              </div>
+            </div>
+          );
+        });
+    } else {
+      // Regular snippet display for other views
+      return snippets.map(renderSnippetCard);
+    }
   };
 
   if (loading) {
@@ -1182,180 +1436,7 @@ function App() {
                     : "All Snippets"}
                   {currentFolder !== "/" && ` in ${currentFolder}`}
                 </h2>
-                <div className="snippets-grid">
-                  {view === "my-snippets"
-                    ? // Group snippets by folder and sort folders
-                      Object.entries(
-                        snippets.reduce((acc, snippet) => {
-                          const folder = snippet.folderPath || "/";
-                          if (!acc[folder]) acc[folder] = [];
-                          acc[folder].push(snippet);
-                          return acc;
-                        }, {})
-                      )
-                        .sort(([folderA], [folderB]) =>
-                          folderA.localeCompare(folderB)
-                        )
-                        .map(([folder, folderSnippets]) => {
-                          // Skip empty folders
-                          if (folderSnippets.length === 0) return null;
-
-                          // Get the folder name for display
-                          const folderDisplay =
-                            folder === "/" ? "Root" : folder.split("/").pop();
-                          const fullPath = folder === "/" ? "Root" : folder;
-
-                          return (
-                            <div key={folder} className="folder-group">
-                              <div className="folder-group-header">
-                                <div className="folder-group-title">
-                                  <FiFolder />
-                                  <h3>{folderDisplay}</h3>
-                                  <span className="folder-path">
-                                    {fullPath}
-                                  </span>
-                                </div>
-                                <div className="folder-group-actions">
-                                  <span className="snippet-count">
-                                    {folderSnippets.length} snippet
-                                    {folderSnippets.length !== 1 ? "s" : ""}
-                                  </span>
-                                  <button
-                                    onClick={() => setCurrentFolder(folder)}
-                                    className="btn btn-outline btn-sm"
-                                  >
-                                    Open Folder
-                                  </button>
-                                </div>
-                              </div>
-                              <div className="snippets-grid">
-                                {folderSnippets.map((snippet) => (
-                                  <div
-                                    key={snippet._id}
-                                    className="snippet-card"
-                                  >
-                                    <div className="snippet-header">
-                                      <h3>{snippet.title || "Untitled"}</h3>
-                                      <div className="snippet-badges">
-                                        <span className="language-badge">
-                                          {snippet.language || "text"}
-                                        </span>
-                                        {snippet.isPublic && (
-                                          <span className="public-badge">
-                                            Public
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-
-                                    <div className="snippet-meta">
-                                      <span>
-                                        By: {snippet.userName || "Unknown"}
-                                      </span>
-                                      <span>
-                                        {new Date(
-                                          snippet.createdAt
-                                        ).toLocaleDateString()}
-                                      </span>
-                                    </div>
-
-                                    {snippet.description && (
-                                      <p className="snippet-description">
-                                        {snippet.description}
-                                      </p>
-                                    )}
-
-                                    <div className="code-container">
-                                      <SyntaxHighlighter
-                                        language={snippet.language || "text"}
-                                        style={themes[codeTheme]}
-                                        customStyle={{
-                                          padding: "1rem",
-                                          borderRadius: "0.5rem",
-                                          fontSize: "0.9rem",
-                                        }}
-                                      >
-                                        {snippet.code || ""}
-                                      </SyntaxHighlighter>
-                                    </div>
-
-                                    {snippet.tags &&
-                                      Array.isArray(snippet.tags) &&
-                                      snippet.tags.length > 0 && (
-                                        <div className="snippet-tags">
-                                          {snippet.tags.map((tag, index) => (
-                                            <span key={index} className="tag">
-                                              {tag}
-                                            </span>
-                                          ))}
-                                        </div>
-                                      )}
-
-                                    {renderSnippetActions(snippet)}
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          );
-                        })
-                    : // Regular snippet display for other views
-                      snippets.map((snippet) => (
-                        <div key={snippet._id} className="snippet-card">
-                          <div className="snippet-header">
-                            <h3>{snippet.title || "Untitled"}</h3>
-                            <div className="snippet-badges">
-                              <span className="language-badge">
-                                {snippet.language || "text"}
-                              </span>
-                              {snippet.isPublic && (
-                                <span className="public-badge">Public</span>
-                              )}
-                            </div>
-                          </div>
-
-                          <div className="snippet-meta">
-                            <span>By: {snippet.userName || "Unknown"}</span>
-                            <span>
-                              {new Date(snippet.createdAt).toLocaleDateString()}
-                            </span>
-                          </div>
-
-                          {snippet.description && (
-                            <p className="snippet-description">
-                              {snippet.description}
-                            </p>
-                          )}
-
-                          <div className="code-container">
-                            <SyntaxHighlighter
-                              language={snippet.language || "text"}
-                              style={themes[codeTheme]}
-                              customStyle={{
-                                padding: "1rem",
-                                borderRadius: "0.5rem",
-                                fontSize: "0.9rem",
-                              }}
-                            >
-                              {snippet.code || ""}
-                            </SyntaxHighlighter>
-                          </div>
-
-                          {snippet.tags &&
-                            Array.isArray(snippet.tags) &&
-                            snippet.tags.length > 0 && (
-                              <div className="snippet-tags">
-                                {snippet.tags.map((tag, index) => (
-                                  <span key={index} className="tag">
-                                    {tag}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-
-                          {renderSnippetActions(snippet)}
-                        </div>
-                      ))}
-                </div>
+                <div className="snippets-grid">{renderSnippetsList()}</div>
               </section>
             </div>
           </div>
